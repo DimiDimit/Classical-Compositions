@@ -1,0 +1,79 @@
+name: Export
+on:
+  push:
+    paths:
+      - '**.mscx'
+  pull_request:
+    paths:
+      - '**.mscx'
+  release:
+    types: [published]
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: flatpak qpdf
+      - name: Install MuseScore
+        run: |
+          sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y --noninteractive flathub org.musescore.MuseScore
+      - name: Export files
+        shell: bash
+        run: |
+          shopt -s globstar extglob
+
+          for score in **/*.mscx; do
+            echo "Exporting \"$score\"..." >&2
+            mkdir -p "exported/$(cut -d'/' -f1 <<< "$score" | sed 's/^Other$//')"
+            # MuseScore has nasty random crashes at startup and when loading a score!
+            success=false
+            status=1
+            for try in {1..10}; do
+              if flatpak run org.musescore.MuseScore -o "exported/$(cut -d'/' -f1 <<< "$score" | sed 's/^Other$//')/$(basename "$score" .mscx).pdf" "$score"; then
+                success=true
+                break
+              else
+                status="$?"
+              fi
+            done
+            if [[ "$success" != "true" ]]; then
+              echo "Encountered 10 failures in a row, aborting!" >&2
+              exit "$status"
+            fi
+          done
+
+          for dir in exported/*/; do
+            echo "Combining \"$(basename "$dir")\"..." >&2
+            pushd "$dir"
+            if [[ '${{ github.event_name }}' == 'release' ]]; then
+              zip "../$(basename "$dir").zip" *
+            fi
+            printf '%s\0' !(_Cover).pdf |
+              awk 'BEGIN { RS=ORS="\0" } ; { print $NF,$0 }' |
+              sort -nzk 1 |
+              cut -zd' ' -f2- |
+              xargs -0 sh -c 'qpdf --empty --pages '"'$([[ -f "_Cover.pdf" ]] && echo "_Cover.pdf")'"' "$@" -- '"'../$(basename "$dir").pdf'" "$0"
+            popd
+          done
+
+          if [[ '${{ github.event_name }}' == 'release' ]]; then
+            find exported -type f -name '* *' -maxdepth 1 -exec bash -c 'mv -v "$0" "${0// /_}"' '{}' ';'
+          fi
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: "${{ github.event_name == 'push' || github.event_name == 'pull_request' }}"
+        with:
+          path: exported/
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        if: "${{ github.event_name == 'release' }}"
+        with:
+          files: exported/*
